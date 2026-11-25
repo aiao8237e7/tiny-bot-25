@@ -2,11 +2,12 @@
 // Protocol: agent-fun/bars-replay/v1 over NDJSON on stdin/stdout.
 // Strategy: per symbol, buy when the fast EMA (8) sits above the slow EMA
 // (21) and is still rising, with price above the slow EMA; exit on the
-// reverse cross, on an 8% stop-loss from the fill price, or on a 25%
-// take-profit. One position per symbol, 20% of equity each, at most 5 open
-// at once. A global 12% equity-drawdown halt flattens everything and stops
-// trading. Fully deterministic: every decision is a pure function of past
-// closes.
+// reverse cross, on an 8% stop-loss from the fill price, or on an 8%
+// trailing stop from the highest close since entry. One position per
+// symbol, 20% of equity each (halved to 10% while SOL itself is in a
+// downtrend), at most 5 open at once. A global 12% equity-drawdown halt
+// flattens everything and stops trading. Fully deterministic: every
+// decision is a pure function of past closes.
 
 import * as readline from "node:readline";
 
@@ -16,7 +17,7 @@ const MIN_BARS = SLOW_LEN + 2;
 const TARGET_WEIGHT_BPS = 2000; // 20% of equity per position
 const MAX_POSITIONS = 5;
 const STOP_LOSS = 0.92; // sell at -8% from entry
-const TAKE_PROFIT = 1.25; // sell at +25% from entry
+const TRAIL_DROP = 0.92; // sell at -8% from the highest close since entry
 const MAX_DRAWDOWN_HALT = 0.88; // flatten + halt if equity < 88% of peak
 const MAX_SPIKE = 0.12; // do not chase a single-bar jump above +12%
 const MAX_SLIPPAGE_BPS = 150;
@@ -40,6 +41,7 @@ type SymState = {
   emaSlow: number;
   prevFast: number;
   entry: number; // fill price of the open position, 0 when flat
+  peak: number; // highest close since entry, 0 when flat
 };
 
 const symbols = new Map<string, SymState>();
@@ -60,8 +62,14 @@ function onFill(symbol: string, side: string, status: string, priceRaw: string):
   if (status !== "filled") return;
   const st = symbols.get(symbol);
   if (!st) return;
-  if (side === "buy") st.entry = toPrice(priceRaw, st.scale);
-  if (side === "sell") st.entry = 0;
+  if (side === "buy") {
+    st.entry = toPrice(priceRaw, st.scale);
+    st.peak = st.entry;
+  }
+  if (side === "sell") {
+    st.entry = 0;
+    st.peak = 0;
+  }
 }
 
 // Record one new bar; returns false when the bar is stale or unknown.
@@ -80,6 +88,7 @@ function ingest(bar: Bar): boolean {
     st.emaSlow = close * emaAlpha(SLOW_LEN) + st.emaSlow * (1 - emaAlpha(SLOW_LEN));
   }
   st.closes.push(close);
+  if (st.entry > 0 && close > st.peak) st.peak = close;
   if (st.closes.length > 400) st.closes.shift();
   return true;
 }
@@ -92,9 +101,10 @@ function decide(symbol: string, cash: bigint, equity: bigint, positions: Map<str
   const qty = positions.get(symbol) ?? 0n;
   const holding = qty > 0n;
 
-  // Exits first: stop-loss, take-profit, trend reversal.
+  // Exits first: stop-loss, trailing stop from the peak since entry,
+  // trend reversal.
   if (holding && st.entry > 0) {
-    if (close <= st.entry * STOP_LOSS || close >= st.entry * TAKE_PROFIT) {
+    if (close <= st.entry * STOP_LOSS || (st.peak > 0 && close <= st.peak * TRAIL_DROP)) {
       return [{ side: "sell", client_id: `s${orderSeq++}-${symbol}`, symbol, qty: qty.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
   }
@@ -111,7 +121,15 @@ function decide(symbol: string, cash: bigint, equity: bigint, positions: Map<str
   const prevClose = st.closes[st.closes.length - 2];
   if (prevClose > 0 && close / prevClose - 1 > MAX_SPIKE) return [];
 
-  const notional = (equity * BigInt(TARGET_WEIGHT_BPS)) / 10000n;
+  // Regime sizing: when SOL itself is in a downtrend (fast EMA below
+  // slow EMA), halve the position size instead of blocking entries
+  // outright, so the bot still clears the 8-trade minimum while
+  // risking less in a falling market.
+  const sol = symbols.get("SOL");
+  const solDown = !!(sol && sol.closes.length >= MIN_BARS && sol.emaFast <= sol.emaSlow);
+  const weightBps = solDown ? TARGET_WEIGHT_BPS / 2 : TARGET_WEIGHT_BPS;
+
+  const notional = (equity * BigInt(weightBps)) / 10000n;
   if (notional <= 0n || cash < notional / 2n) return [];
   const spend = notional < cash ? notional : cash;
   return [{ side: "buy", client_id: `b${orderSeq++}-${symbol}`, symbol, notional_quote_units: spend.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS }];
@@ -178,6 +196,7 @@ function main(): void {
           emaSlow: 0,
           prevFast: 0,
           entry: 0,
+          peak: 0,
         });
       }
       return;
